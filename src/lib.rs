@@ -230,17 +230,19 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
                        args: HashMap<&str, impl ToString>)
                        -> HttpResult<U> where U: for<'de> serde::Deserialize<'de> {
         let re = Regex::new(PATH_PARAMS_PATTERN).unwrap();
-        let path_params = re.captures_iter(&config.url);
-        let url = path_params.map(|c| c.extract::<1>())
-            .fold(config.url.clone(),
-                  |u, (p, g)|
-                      u.replace(p, &args[g[0]].to_string()));
+        let path_params = re.captures_iter(&config.url)
+            .map(|c| c.extract::<1>());
+
+        let mut values = args;
+        let url = path_params.fold(config.url.clone(), |u, (p, g)|
+            u.replace(p, &values.remove(g[0])
+                .unwrap_or_else(|| panic!("Url Parameter {} missing!", g[0])).to_string()));
+
         self.do_request::<U>(config, url.to_string(),
                              HashMap::new(),
                              HashMap::<String, String>::new(), payload).await
         // todo!()
     }
-
 }
 
 
@@ -277,6 +279,7 @@ mod tests {
             }, None, HashMap::from([("id", 2)])).await;
 
         println!("{}", res.body.data.email);
+
         assert_eq!(res.body.data.id, 2);
     }
 }
