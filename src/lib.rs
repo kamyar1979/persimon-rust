@@ -5,9 +5,11 @@ use std::any::Any;
 use std::string::String;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::fmt::Debug;
+use std::collections::hash_map::DefaultHasher;
+use std::fmt::{Debug, format};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
+use std::ptr::hash;
 use std::rc::Rc;
 use std::str::Bytes;
 use std::time::Duration;
@@ -153,7 +155,7 @@ pub struct HttpInvoker<T = NullCacheProvider> where T: CacheProvider {
 pub enum Payload<T> where T: Serialize {
     Empty,
     Text(String),
-    Object(T)
+    Object(T),
 }
 
 impl<T: Serialize> ToString for Payload<T> {
@@ -174,12 +176,12 @@ impl Payload<String> {
 
 impl<T> HttpInvoker<T> where T: CacheProvider {
     async fn do_request<U>(&self,
-                           config: HttpCallConfiguration,
+                           config: &HttpCallConfiguration,
                            url: String,
                            headers: HashMap<String, String>,
                            query_params: HashMap<String, impl ToString>,
                            payload: String)
-                           -> HttpResult<U> where U: for<'de> serde::Deserialize<'de> {
+                           -> HttpResult<U> where U: for<'de> serde::Deserialize<'de> + Send {
         struct HttpRequest {
             method: Method,
             uri: String,
@@ -202,9 +204,9 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
             where for<'de> U: serde::de::Deserialize<'de> {
             let client = reqwest::Client::new();
             let res = client.request(
-                    req.method.clone(),
-                    req.uri.clone())
-                    .body(req.payload.clone()).send().await;
+                req.method.clone(),
+                req.uri.clone())
+                .body(req.payload.clone()).send().await;
 
             match res {
                 Ok(result) => {
@@ -229,7 +231,7 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
             }
         }
 
-        let method = config.method;
+        let method = config.method.clone();
         let mut header_map = HeaderMap::new();
         for (key, value) in headers {
             header_map.append(HeaderName::try_from(key).unwrap(),
@@ -249,14 +251,14 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
     async fn invoke<U>(&self,
                        config: HttpCallConfiguration,
                        payload: Payload<impl Serialize>,
-                       args: HashMap<&str, impl ToString>)
-                       -> HttpResult<U> where U: for<'de> serde::Deserialize<'de> {
+                       args: HashMap<&str, impl ToString + Hash + Copy>)
+                       -> HttpResult<U> where U: for<'de> serde::Deserialize<'de> + Send + Sync {
         let re = Regex::new(PATH_PARAMS_PATTERN).unwrap();
         let path_params = re.captures_iter(&config.url)
             .map(|c| c.extract::<1>());
 
 
-        let mut values = args;
+        let mut values = args.clone();
         let url = path_params.fold(config.url.clone(), |u, (p, g)|
             u.replace(p, &values.remove(g[0])
                 .unwrap_or_else(|| panic!("Url Parameter '{}' missing!", g[0])).to_string()));
@@ -266,10 +268,33 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
         let query_params = values.iter()
             .map(|(p, v)| (p.to_string(), v.to_string())).collect();
 
-        self.do_request::<U>(config, url.to_string(),
+        let ft = config.fault_tolerance.unwrap_or_default();
+        if ft.cache_duration > 0u64 &&
+            self.cache_provider.is_some() {
+            let cache = self.cache_provider.as_ref().unwrap();
+            if cache.is_cache_ready().await {
+                let mut hasher = DefaultHasher::new();
+                config.url.hash(&mut hasher);
+                config.method.hash(&mut hasher);
+                args.iter().for_each(|a| a.hash(&mut hasher));
+                payload.to_string().hash(&mut hasher);
+                let key = format!("http_cache_item:{:x}", hasher.finish()).as_str();
+                if cache.is_cached(key).await {
+                    cache.get_item(key).await.unwrap_or_else(|| panic!("Cache item corrupted!"))
+                } else {
+                    let res = self.do_request::<U>(&config, url.to_string(),
+                                                   headers,
+                                                   query_params, payload.to_string()).await;
+                    if res.status.is_success() {
+                        cache.set_item(key, &res).await;
+                    }
+                    return res;
+                }
+            }
+        }
+        self.do_request::<U>(&config, url.to_string(),
                              headers,
                              query_params, payload.to_string()).await
-        // todo!()
     }
 }
 
