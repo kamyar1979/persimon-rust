@@ -2,12 +2,14 @@
 #![allow(unused_imports)]
 
 use std::any::Any;
+use std::string::String;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::rc::Rc;
+use std::str::Bytes;
 use std::time::Duration;
 use reqwest::{StatusCode, Method, Error};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue,
@@ -18,6 +20,8 @@ use tokio::spawn;
 use serde::{Serialize, Deserialize};
 use async_trait::async_trait;
 use futures::{StreamExt, TryFutureExt};
+use crate::Payload::{Object, Text};
+use serde_json;
 
 const PATH_PARAMS_PATTERN: &str = r"\{(\S+?)\}";
 const CACHE_KEY_PATTERN: &str = "http_cache_item:{:x}:{:x}";
@@ -146,19 +150,41 @@ pub struct HttpInvoker<T = NullCacheProvider> where T: CacheProvider {
     proxy: Option<String>,
 }
 
+pub enum Payload<T> where T: Serialize {
+    Empty,
+    Text(String),
+    Object(T)
+}
+
+impl<T: Serialize> ToString for Payload<T> {
+    fn to_string(&self) -> String {
+        match self {
+            Self::Empty => String::new(),
+            Text(s) => s.to_string(),
+            Object(d) => serde_json::to_string(&d).unwrap()
+        }
+    }
+}
+
+impl Payload<String> {
+    fn empty() -> Self {
+        Payload::Empty as Payload<String>
+    }
+}
+
 impl<T> HttpInvoker<T> where T: CacheProvider {
     async fn do_request<U>(&self,
                            config: HttpCallConfiguration,
                            url: String,
                            headers: HashMap<String, String>,
                            query_params: HashMap<String, impl ToString>,
-                           payload: Option<String>)
+                           payload: String)
                            -> HttpResult<U> where U: for<'de> serde::Deserialize<'de> {
         struct HttpRequest {
             method: Method,
             uri: String,
             header_map: HeaderMap,
-            payload: Option<String>,
+            payload: String,
         }
 
         let uri = url + "?" + &query_params.iter()
@@ -175,15 +201,10 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
                                   -> Result<HttpResult<U>, Error>
             where for<'de> U: serde::de::Deserialize<'de> {
             let client = reqwest::Client::new();
-            let res = match &req.payload {
-                None => client.request(
-                    req.method.clone(),
-                    req.uri.clone()),
-                Some(p) => client.request(
+            let res = client.request(
                     req.method.clone(),
                     req.uri.clone())
-                    .body(p.clone())
-            }.send().await;
+                    .body(req.payload.clone()).send().await;
 
             match res {
                 Ok(result) => {
@@ -224,23 +245,30 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
 
         policy.retry(|| inner_invoker(&req)).await.unwrap()
     }
+
     async fn invoke<U>(&self,
                        config: HttpCallConfiguration,
-                       payload: Option<String>,
+                       payload: Payload<impl Serialize>,
                        args: HashMap<&str, impl ToString>)
                        -> HttpResult<U> where U: for<'de> serde::Deserialize<'de> {
         let re = Regex::new(PATH_PARAMS_PATTERN).unwrap();
         let path_params = re.captures_iter(&config.url)
             .map(|c| c.extract::<1>());
 
+
         let mut values = args;
         let url = path_params.fold(config.url.clone(), |u, (p, g)|
             u.replace(p, &values.remove(g[0])
-                .unwrap_or_else(|| panic!("Url Parameter {} missing!", g[0])).to_string()));
+                .unwrap_or_else(|| panic!("Url Parameter '{}' missing!", g[0])).to_string()));
+        let headers = config.header_params.iter()
+            .map(|p| (p.to_string(), values.remove(p.as_str())
+                .unwrap_or_else(|| panic!("Header parameter '{}' missing!", p)).to_string())).collect();
+        let query_params = values.iter()
+            .map(|(p, v)| (p.to_string(), v.to_string())).collect();
 
         self.do_request::<U>(config, url.to_string(),
-                             HashMap::new(),
-                             HashMap::<String, String>::new(), payload).await
+                             headers,
+                             query_params, payload.to_string()).await
         // todo!()
     }
 }
@@ -276,7 +304,7 @@ mod tests {
             HttpCallConfiguration {
                 url: "https://reqres.in/api/users/{id}".to_string(),
                 ..Default::default()
-            }, None, HashMap::from([("id", 2)])).await;
+            }, Payload::empty(), HashMap::from([("id", 2)])).await;
 
         println!("{}", res.body.data.email);
 

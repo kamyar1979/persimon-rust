@@ -13,3 +13,4 @@ again = "0.1"
 regex = "1.9.1"
 serde = { version = "1.0", features = ["derive"] }
 async-trait = "0.1.72"
+serde_json = "1.0"
