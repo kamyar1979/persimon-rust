@@ -39,6 +39,7 @@ pub struct HttpResult<T> {
     headers: HashMap<String, String>,
 }
 
+#[derive(Clone)]
 pub struct RetryConfig {
     total: u8,
     backoff_factor: u8,
@@ -64,6 +65,7 @@ impl Default for RetryConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct FaultTolerance {
     cache_duration: u64,
     timeout: u8,
@@ -86,6 +88,7 @@ impl Default for FaultTolerance {
     }
 }
 
+#[derive(Clone)]
 pub struct HttpCallConfiguration {
     url: String,
     method: Method,
@@ -176,7 +179,7 @@ impl Payload<String> {
 
 impl<T> HttpInvoker<T> where T: CacheProvider {
     async fn do_request<U>(&self,
-                           config: &HttpCallConfiguration,
+                           config: HttpCallConfiguration,
                            url: String,
                            headers: HashMap<String, String>,
                            query_params: HashMap<String, impl ToString>,
@@ -268,7 +271,7 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
         let query_params = values.iter()
             .map(|(p, v)| (p.to_string(), v.to_string())).collect();
 
-        let ft = config.fault_tolerance.unwrap_or_default();
+        let ft = config.clone().fault_tolerance.unwrap_or_default();
         if ft.cache_duration > 0u64 &&
             self.cache_provider.is_some() {
             let cache = self.cache_provider.as_ref().unwrap();
@@ -278,21 +281,22 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
                 config.method.hash(&mut hasher);
                 args.iter().for_each(|a| a.hash(&mut hasher));
                 payload.to_string().hash(&mut hasher);
-                let key = format!("http_cache_item:{:x}", hasher.finish()).as_str();
-                if cache.is_cached(key).await {
-                    cache.get_item(key).await.unwrap_or_else(|| panic!("Cache item corrupted!"))
+                let key = format!("http_cache_item:{:x}", hasher.finish());
+
+                if cache.is_cached(&key).await {
+                    cache.get_item(&key).await.unwrap_or_else(|| panic!("Cache item corrupted!"))
                 } else {
-                    let res = self.do_request::<U>(&config, url.to_string(),
+                    let res = self.do_request::<U>(config.clone(), url.to_string(),
                                                    headers,
                                                    query_params, payload.to_string()).await;
                     if res.status.is_success() {
-                        cache.set_item(key, &res).await;
+                        cache.set_item(&key, &res).await;
                     }
                     return res;
                 }
             }
         }
-        self.do_request::<U>(&config, url.to_string(),
+        self.do_request::<U>(config, url.to_string(),
                              headers,
                              query_params, payload.to_string()).await
     }
