@@ -8,12 +8,12 @@ use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::{Debug, format};
 use std::hash::{Hash, Hasher};
+use std::io::{Cursor, Read};
 use std::ops::Deref;
 use std::ptr::hash;
 use std::rc::Rc;
-use std::str::Bytes;
 use std::time::Duration;
-use reqwest::{StatusCode, Method, Error};
+use reqwest::{StatusCode, Method};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue,
                       ACCEPT, ACCEPT_LANGUAGE, CONTENT_TYPE, CONTENT_LANGUAGE, AUTHORIZATION};
 use regex::Regex;
@@ -21,9 +21,15 @@ use again::RetryPolicy;
 use tokio::spawn;
 use serde::{Serialize, Deserialize};
 use async_trait::async_trait;
+use fred::bytes::Bytes;
 use futures::{StreamExt, TryFutureExt};
 use crate::Payload::{Object, Text};
 use serde_json;
+use fred::prelude::*;
+use fred::types::Blocking::Error;
+use futures::io::copy_buf;
+use rmp_serde::{Deserializer, Serializer};
+use serde::__private::de::IdentifierDeserializer;
 
 const PATH_PARAMS_PATTERN: &str = r"\{(\S+?)\}";
 const CACHE_KEY_PATTERN: &str = "http_cache_item:{:x}:{:x}";
@@ -33,11 +39,33 @@ const DEFAULT_SERIALIZATION: &str = "application/json";
 pub const API_KEY: &str = "X-Api-Key";
 
 
-pub struct HttpResult<T> {
+fn serialize_custom<S>(data: &StatusCode, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+{
+    // Your custom serialization logic here
+    // For example, convert the integer to a string and serialize
+    serializer.serialize_u16(data.as_u16())
+}
+
+fn deserialize_custom<'de, D>(deserializer: D) -> Result<StatusCode, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+{
+    // Your custom deserialization logic here
+    // For example, parse the string back to an integer
+    let s = String::deserialize(deserializer)?;
+    StatusCode::from_u16(s.parse::<u16>().unwrap()).map_err(serde::de::Error::custom)
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct HttpResult<T> where T: Serialize {
+    #[serde(serialize_with = "serialize_custom", deserialize_with = "deserialize_custom")]
     status: StatusCode,
     body: T,
-    headers: HashMap<String, String>,
+    headers: HashMap<String, String>
 }
+
 
 #[derive(Clone)]
 pub struct RetryConfig {
@@ -67,7 +95,7 @@ impl Default for RetryConfig {
 
 #[derive(Clone)]
 pub struct FaultTolerance {
-    cache_duration: u64,
+    cache_duration: u32,
     timeout: u8,
     success_status: HashSet<StatusCode>,
     retry_config: RetryConfig,
@@ -122,12 +150,62 @@ impl Hash for HttpCallConfiguration {
 
 #[async_trait]
 pub trait CacheProvider {
+    fn new(url: String) -> Self;
     async fn is_cache_ready(&self) -> bool;
     async fn is_cached(&self, key: &str) -> bool;
-    async fn get_item<T>(&self, key: &str) -> Option<T>;
-    async fn set_item<T>(&self, key: &str, val: T) where T: Send;
+    async fn get_item<T>(&self, key: &str) -> Option<T> where T: for<'de> serde::Deserialize<'de> + Send;
+    async fn set_item<T>(&self, key: &str, val: T, duration: u32) where T: Send + Serialize;
     async fn delete_items(&self, wildcard: &str);
     async fn clear(&self);
+}
+
+pub struct RedisCacheProvider {
+    client: RedisClient
+}
+
+#[async_trait]
+impl CacheProvider for RedisCacheProvider {
+    fn new(url: String) -> Self {
+        let config = RedisConfig::from_url(&url);
+        let perf = PerformanceConfig::default();
+        let policy = ReconnectPolicy::default();
+        Self{ client: RedisClient::new(config.unwrap(), Some(perf), Some(policy))}
+    }
+
+    async fn is_cache_ready(&self) -> bool {
+        self.client.connect();
+        self.client.wait_for_connect().await.expect("Could not connect to Redis");
+        self.client.ping().await == Ok("PONG".to_string())
+    }
+
+    async fn is_cached(&self, key: &str) -> bool {
+        self.client.exists(key).await.unwrap_or(false)
+    }
+
+    async fn get_item<T>(&self, key: &str) -> Option<T> where T: for<'de> serde::Deserialize<'de> + Send {
+        let data: RedisResult<String> = self.client.get(key).await;
+        match data {
+            Ok(b) => rmp_serde::from_read(Cursor::new(b)).unwrap_or(None),
+            _ => None
+        }
+    }
+
+    async fn set_item<T>(&self, key: &str, val: T, duration: u32) where T: Serialize + Send {
+        let mut buf = Vec::new();
+        val.serialize(&mut Serializer::new(&mut buf)).unwrap();
+        let bytes: Bytes = Bytes::from(buf);
+        let _: () = self.client.set(key, RedisValue::from(bytes),
+                        Some(Expiration::EX(duration.into())),
+                        None, false).await.expect("Unable to cache result");
+    }
+
+    async fn delete_items(&self, wildcard: &str) {
+        let _ : u32 = self.client.del(wildcard).await.unwrap();
+    }
+
+    async fn clear(&self) {
+        let _: () = self.client.flushall_cluster().await.unwrap();
+    }
 }
 
 pub struct NullCacheProvider {}
@@ -135,16 +213,19 @@ pub struct NullCacheProvider {}
 #[async_trait]
 #[allow(unused_variables)]
 impl CacheProvider for NullCacheProvider {
+    fn new(url: String) -> Self {
+        NullCacheProvider{}
+    }
     async fn is_cache_ready(&self) -> bool {
         true
     }
     async fn is_cached(&self, key: &str) -> bool {
         false
     }
-    async fn get_item<T>(&self, key: &str) -> Option<T> {
+    async fn get_item<T>(&self, key: &str) -> Option<T> where T: for<'de> serde::Deserialize<'de> + Send {
         None
     }
-    async fn set_item<T>(&self, key: &str, val: T) where T: Send {}
+    async fn set_item<T>(&self, key: &str, val: T, duration: u32) where T: Send {}
     async fn delete_items(&self, wildcard: &str) {}
     async fn clear(&self) {}
 }
@@ -184,7 +265,7 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
                            headers: HashMap<String, String>,
                            query_params: HashMap<String, impl ToString>,
                            payload: String)
-                           -> HttpResult<U> where U: for<'de> serde::Deserialize<'de> + Send {
+                           -> HttpResult<U> where U: for<'de> serde::Deserialize<'de> + Serialize + Send {
         struct HttpRequest {
             method: Method,
             uri: String,
@@ -203,12 +284,13 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
         let policy = RetryPolicy::fixed(delay).with_max_retries(tries);
 
         async fn inner_invoker<U>(req: &HttpRequest)
-                                  -> Result<HttpResult<U>, Error>
-            where for<'de> U: serde::de::Deserialize<'de> {
+                                  -> Result<HttpResult<U>, reqwest::Error>
+            where for<'de> U: serde::de::Deserialize<'de> + Serialize {
             let client = reqwest::Client::new();
             let res = client.request(
                 req.method.clone(),
                 req.uri.clone())
+                .timeout(Duration::from_secs(10))
                 .body(req.payload.clone()).send().await;
 
             match res {
@@ -255,7 +337,7 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
                        config: HttpCallConfiguration,
                        payload: Payload<impl Serialize>,
                        args: HashMap<&str, impl ToString + Hash + Copy>)
-                       -> HttpResult<U> where U: for<'de> serde::Deserialize<'de> + Send + Sync {
+                       -> HttpResult<U> where U: for<'de> Deserialize<'de> + Serialize + Send + Sync {
         let re = Regex::new(PATH_PARAMS_PATTERN).unwrap();
         let path_params = re.captures_iter(&config.url)
             .map(|c| c.extract::<1>());
@@ -272,7 +354,7 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
             .map(|(p, v)| (p.to_string(), v.to_string())).collect();
 
         let ft = config.clone().fault_tolerance.unwrap_or_default();
-        if ft.cache_duration > 0u64 &&
+        if ft.cache_duration > 0u32 &&
             self.cache_provider.is_some() {
             let cache = self.cache_provider.as_ref().unwrap();
             if cache.is_cache_ready().await {
@@ -290,7 +372,7 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
                                                    headers,
                                                    query_params, payload.to_string()).await;
                     if res.status.is_success() {
-                        cache.set_item(&key, &res).await;
+                        cache.set_item(&key, &res, ft.cache_duration).await;
                     }
                     return res;
                 }
@@ -308,7 +390,7 @@ mod tests {
     use futures::TryFutureExt;
     use super::*;
 
-    #[derive(Deserialize)]
+    #[derive(Serialize, Deserialize)]
     struct User {
         id: u32,
         email: String,
@@ -317,7 +399,7 @@ mod tests {
         avatar: String,
     }
 
-    #[derive(Deserialize)]
+    #[derive(Serialize, Deserialize)]
     struct Response<T> {
         data: T,
     }
