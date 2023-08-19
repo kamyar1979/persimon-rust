@@ -30,6 +30,7 @@ use fred::types::Blocking::Error;
 use fred::types::ClusterHash::Custom;
 use futures::io::copy_buf;
 use ciborium::{de, ser};
+use fasthash::{FastHasher, MurmurHasher};
 
 const PATH_PARAMS_PATTERN: &str = r"\{(\S+?)\}";
 const CACHE_KEY_PATTERN: &str = "http_cache_item:{:x}:{:x}";
@@ -141,6 +142,7 @@ impl Hash for HttpCallConfiguration {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.url.hash(state);
         self.method.hash(state);
+        state.finish();
     }
 }
 
@@ -362,7 +364,7 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
             self.cache_provider.is_some() {
             let cache = self.cache_provider.as_ref().unwrap();
             if cache.is_cache_ready().await {
-                let mut hasher = DefaultHasher::new();
+                let mut hasher = MurmurHasher::new();
                 config.url.hash(&mut hasher);
                 config.method.hash(&mut hasher);
                 args.iter().for_each(|a| a.hash(&mut hasher));
