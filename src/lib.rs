@@ -31,6 +31,7 @@ use fred::types::ClusterHash::Custom;
 use futures::io::copy_buf;
 use rmp_serde::{Deserializer, Serializer};
 use crate::tests::{ApiResponse, Employee};
+use ciborium::{de, ser};
 
 const PATH_PARAMS_PATTERN: &str = r"\{(\S+?)\}";
 const CACHE_KEY_PATTERN: &str = "http_cache_item:{:x}:{:x}";
@@ -183,7 +184,8 @@ impl CacheProvider for RedisCacheProvider {
         let data: RedisResult<Bytes> = self.client.get(key).await;
         match data {
             Ok(b) =>  {
-                rmp_serde::from_slice(&b).unwrap_or(None)
+                de::from_reader(Cursor::new(b)).unwrap()
+                // rmp_serde::from_slice(&b).unwrap_or(None)
             },
             _ => None
         }
@@ -191,7 +193,8 @@ impl CacheProvider for RedisCacheProvider {
 
     async fn set_item<T>(&self, key: &str, val: T, duration: u32) where T: Serialize + Send {
         let mut buf = Vec::new();
-        val.serialize(&mut Serializer::new(&mut buf)).unwrap();
+        ser::into_writer( &val, &mut buf).expect("Unable to cache result");
+        // val.serialize(&mut Serializer::new(&mut buf)).unwrap();
         let bytes: Bytes = Bytes::from(buf);
 
         let _: () = self.client.set(key, RedisValue::from(bytes),
