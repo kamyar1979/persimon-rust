@@ -29,8 +29,6 @@ use fred::prelude::*;
 use fred::types::Blocking::Error;
 use fred::types::ClusterHash::Custom;
 use futures::io::copy_buf;
-use rmp_serde::{Deserializer, Serializer};
-use crate::tests::{ApiResponse, Employee};
 use ciborium::{de, ser};
 
 const PATH_PARAMS_PATTERN: &str = r"\{(\S+?)\}";
