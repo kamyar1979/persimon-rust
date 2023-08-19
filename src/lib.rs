@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::string::String;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -13,7 +13,7 @@ use std::ops::Deref;
 use std::ptr::hash;
 use std::rc::Rc;
 use std::time::Duration;
-use reqwest::{StatusCode, Method};
+use reqwest::{StatusCode, Method, Response};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue,
                       ACCEPT, ACCEPT_LANGUAGE, CONTENT_TYPE, CONTENT_LANGUAGE, AUTHORIZATION};
 use regex::Regex;
@@ -27,9 +27,10 @@ use crate::Payload::{Object, Text};
 use serde_json;
 use fred::prelude::*;
 use fred::types::Blocking::Error;
+use fred::types::ClusterHash::Custom;
 use futures::io::copy_buf;
 use rmp_serde::{Deserializer, Serializer};
-use serde::__private::de::IdentifierDeserializer;
+use crate::tests::{ApiResponse, Employee};
 
 const PATH_PARAMS_PATTERN: &str = r"\{(\S+?)\}";
 const CACHE_KEY_PATTERN: &str = "http_cache_item:{:x}:{:x}";
@@ -43,8 +44,6 @@ fn serialize_custom<S>(data: &StatusCode, serializer: S) -> Result<S::Ok, S::Err
     where
         S: serde::Serializer,
 {
-    // Your custom serialization logic here
-    // For example, convert the integer to a string and serialize
     serializer.serialize_u16(data.as_u16())
 }
 
@@ -52,10 +51,8 @@ fn deserialize_custom<'de, D>(deserializer: D) -> Result<StatusCode, D::Error>
     where
         D: serde::Deserializer<'de>,
 {
-    // Your custom deserialization logic here
-    // For example, parse the string back to an integer
-    let s = String::deserialize(deserializer)?;
-    StatusCode::from_u16(s.parse::<u16>().unwrap()).map_err(serde::de::Error::custom)
+    let s = u16::deserialize(deserializer)?;
+    StatusCode::from_u16(s).map_err(serde::de::Error::custom)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -183,9 +180,11 @@ impl CacheProvider for RedisCacheProvider {
     }
 
     async fn get_item<T>(&self, key: &str) -> Option<T> where T: for<'de> serde::Deserialize<'de> + Send {
-        let data: RedisResult<String> = self.client.get(key).await;
+        let data: RedisResult<Bytes> = self.client.get(key).await;
         match data {
-            Ok(b) => rmp_serde::from_read(Cursor::new(b)).unwrap_or(None),
+            Ok(b) =>  {
+                rmp_serde::from_slice(&b).unwrap_or(None)
+            },
             _ => None
         }
     }
@@ -194,6 +193,7 @@ impl CacheProvider for RedisCacheProvider {
         let mut buf = Vec::new();
         val.serialize(&mut Serializer::new(&mut buf)).unwrap();
         let bytes: Bytes = Bytes::from(buf);
+
         let _: () = self.client.set(key, RedisValue::from(bytes),
                         Some(Expiration::EX(duration.into())),
                         None, false).await.expect("Unable to cache result");
@@ -312,7 +312,10 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
                         body,
                     })
                 }
-                Err(e) => Err(e)
+                Err(e) =>  {
+                    println!("{}", e);
+                    Err(e)
+                }
             }
         }
 
@@ -365,7 +368,7 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
                 payload.to_string().hash(&mut hasher);
                 let key = format!("http_cache_item:{:x}", hasher.finish());
 
-                if cache.is_cached(&key).await {
+                return if cache.is_cached(&key).await {
                     cache.get_item(&key).await.unwrap_or_else(|| panic!("Cache item corrupted!"))
                 } else {
                     let res = self.do_request::<U>(config.clone(), url.to_string(),
@@ -374,7 +377,7 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
                     if res.status.is_success() {
                         cache.set_item(&key, &res, ft.cache_duration).await;
                     }
-                    return res;
+                    res
                 }
             }
         }
@@ -387,38 +390,46 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
 
 #[cfg(test)]
 mod tests {
+    use fred::types::InfoKind::Default;
     use futures::TryFutureExt;
     use super::*;
 
     #[derive(Serialize, Deserialize)]
-    struct User {
+    pub struct Employee {
+        employee_age: u32,
+        employee_name: String,
+        employee_salary: u32,
         id: u32,
-        email: String,
-        first_name: String,
-        last_name: String,
-        avatar: String,
+        profile_image: String
     }
 
     #[derive(Serialize, Deserialize)]
-    struct Response<T> {
+    pub struct ApiResponse<T> {
         data: T,
     }
 
     #[tokio::test]
     async fn it_works() {
-        let inv = HttpInvoker::<NullCacheProvider> {
+        let cache = RedisCacheProvider::new("redis://127.0.0.1:6379".to_string());
+        let inv = HttpInvoker::<RedisCacheProvider> {
             base_url: None,
-            cache_provider: None,
+            cache_provider: Some(cache),
             proxy: None,
         };
-        let res = inv.invoke::<Response<User>>(
+
+        use core::default::Default;
+        let res = inv.invoke::<ApiResponse<Employee>>(
             HttpCallConfiguration {
-                url: "https://reqres.in/api/users/{id}".to_string(),
+                url: "https://dummy.restapiexample.com/api/v1/employee/{id}".to_string(),
+                fault_tolerance: Some(FaultTolerance {
+                    cache_duration: 1000,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }, Payload::empty(), HashMap::from([("id", 2)])).await;
+            }, Payload::empty(), HashMap::from([("id", 1)])).await;
 
-        println!("{}", res.body.data.email);
+        println!("{}", res.body.data.employee_name);
 
-        assert_eq!(res.body.data.id, 2);
+        assert_eq!(res.body.data.id, 1);
     }
 }
