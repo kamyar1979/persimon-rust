@@ -4,7 +4,7 @@
 use std::any::{Any, TypeId};
 use std::string::String;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::{Debug, format};
 use std::hash::{Hash, Hasher};
@@ -23,7 +23,7 @@ use serde::{Serialize, Deserialize};
 use async_trait::async_trait;
 use fred::bytes::Bytes;
 use futures::{StreamExt, TryFutureExt};
-use crate::Payload::{Object, Text};
+use crate::Payload::{Binary, Object, Text};
 use serde_json;
 use fred::prelude::*;
 use fred::types::Blocking::Error;
@@ -31,6 +31,8 @@ use fred::types::ClusterHash::Custom;
 use futures::io::copy_buf;
 use ciborium::{de, ser};
 use fasthash::{FastHasher, MurmurHasher};
+
+type ByteArray = Vec<u8>;
 
 const PATH_PARAMS_PATTERN: &str = r"\{(\S+?)\}";
 const CACHE_KEY_PATTERN: &str = "http_cache_item:{:x}:{:x}";
@@ -241,16 +243,22 @@ pub struct HttpInvoker<T = NullCacheProvider> where T: CacheProvider {
 
 pub enum Payload<T> where T: Serialize {
     Empty,
+    Binary(ByteArray),
     Text(String),
     Object(T),
 }
 
-impl<T: Serialize> ToString for Payload<T> {
-    fn to_string(&self) -> String {
+trait ToBinary {
+    fn to_binary(&self) -> ByteArray;
+}
+
+impl<T: Serialize> ToBinary for Payload<T> {
+    fn to_binary(&self) -> ByteArray {
         match self {
-            Self::Empty => String::new(),
-            Text(s) => s.to_string(),
-            Object(d) => serde_json::to_string(&d).unwrap()
+            Self::Empty => ByteArray::new(),
+            Binary(b) => b.to_vec(),
+            Text(s) => s.as_bytes().to_vec(),
+            Object(d) => serde_json::to_string(&d).unwrap().as_bytes().to_vec()
         }
     }
 }
@@ -267,13 +275,13 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
                            url: String,
                            headers: HashMap<String, String>,
                            query_params: HashMap<String, impl ToString>,
-                           payload: String)
+                           payload: ByteArray)
                            -> HttpResult<U> where U: for<'de> serde::Deserialize<'de> + Serialize + Send {
         struct HttpRequest {
             method: Method,
             uri: String,
             header_map: HeaderMap,
-            payload: String,
+            payload: ByteArray,
         }
 
         let uri = url + "?" + &query_params.iter()
@@ -368,7 +376,7 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
                 config.url.hash(&mut hasher);
                 config.method.hash(&mut hasher);
                 args.iter().for_each(|a| a.hash(&mut hasher));
-                payload.to_string().hash(&mut hasher);
+                payload.to_binary().hash(&mut hasher);
                 let key = format!("http_cache_item:{:x}", hasher.finish());
 
                 return if cache.is_cached(&key).await {
@@ -376,7 +384,7 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
                 } else {
                     let res = self.do_request::<U>(config.clone(), url.to_string(),
                                                    headers,
-                                                   query_params, payload.to_string()).await;
+                                                   query_params, payload.to_binary()).await;
                     if res.status.is_success() {
                         cache.set_item(&key, &res, ft.cache_duration).await;
                     }
@@ -386,7 +394,7 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
         }
         self.do_request::<U>(config, url.to_string(),
                              headers,
-                             query_params, payload.to_string()).await
+                             query_params, payload.to_binary()).await
     }
 }
 
