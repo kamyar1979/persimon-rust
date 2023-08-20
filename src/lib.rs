@@ -62,7 +62,7 @@ pub struct HttpResult<T> where T: Serialize {
     #[serde(serialize_with = "serialize_custom", deserialize_with = "deserialize_custom")]
     status: StatusCode,
     body: T,
-    headers: HashMap<String, String>
+    headers: HashMap<String, String>,
 }
 
 
@@ -94,16 +94,22 @@ impl Default for RetryConfig {
 
 #[derive(Clone)]
 pub struct FaultTolerance {
-    cache_duration: u32,
     timeout: u8,
     success_status: HashSet<StatusCode>,
     retry_config: RetryConfig,
 }
 
+
+#[derive(Clone)]
+pub struct CacheConfig<T: CacheProvider> {
+    duration: u32,
+    provider: T,
+}
+
+
 impl Default for FaultTolerance {
     fn default() -> Self {
         Self {
-            cache_duration: 0,
             timeout: 0,
             success_status: HashSet::from([
                 StatusCode::OK,
@@ -123,7 +129,6 @@ pub struct HttpCallConfiguration {
     raw_response: bool,
     parse_unknown_response: bool,
     header_params: HashSet<String>,
-    fault_tolerance: Option<FaultTolerance>,
 }
 
 impl Default for HttpCallConfiguration {
@@ -135,7 +140,6 @@ impl Default for HttpCallConfiguration {
             raw_response: false,
             parse_unknown_response: true,
             header_params: HashSet::new(),
-            fault_tolerance: Some(FaultTolerance::default()),
         }
     }
 }
@@ -150,7 +154,7 @@ impl Hash for HttpCallConfiguration {
 
 #[async_trait]
 pub trait CacheProvider {
-    fn new(url: String) -> Self;
+    fn new(url: Option<&str>) -> Self;
     async fn is_cache_ready(&self) -> bool;
     async fn is_cached(&self, key: &str) -> bool;
     async fn get_item<T>(&self, key: &str) -> Option<T> where T: for<'de> serde::Deserialize<'de> + Send;
@@ -160,16 +164,20 @@ pub trait CacheProvider {
 }
 
 pub struct RedisCacheProvider {
-    client: RedisClient
+    client: RedisClient,
 }
 
 #[async_trait]
 impl CacheProvider for RedisCacheProvider {
-    fn new(url: String) -> Self {
-        let config = RedisConfig::from_url(&url);
+    fn new(url: Option<&str>) -> Self {
+        let config = if url.is_some() {
+            RedisConfig::from_url(url.unwrap())
+        } else {
+            Ok(RedisConfig::default())
+        };
         let perf = PerformanceConfig::default();
         let policy = ReconnectPolicy::default();
-        Self{ client: RedisClient::new(config.unwrap(), Some(perf), Some(policy))}
+        Self { client: RedisClient::new(config.unwrap(), Some(perf), Some(policy)) }
     }
 
     async fn is_cache_ready(&self) -> bool {
@@ -185,27 +193,26 @@ impl CacheProvider for RedisCacheProvider {
     async fn get_item<T>(&self, key: &str) -> Option<T> where T: for<'de> serde::Deserialize<'de> + Send {
         let data: RedisResult<Bytes> = self.client.get(key).await;
         match data {
-            Ok(b) =>  {
+            Ok(b) => {
                 de::from_reader(Cursor::new(b)).unwrap()
-                // rmp_serde::from_slice(&b).unwrap_or(None)
-            },
+            }
             _ => None
         }
     }
 
     async fn set_item<T>(&self, key: &str, val: T, duration: u32) where T: Serialize + Send {
         let mut buf = Vec::new();
-        ser::into_writer( &val, &mut buf).expect("Unable to cache result");
+        ser::into_writer(&val, &mut buf).expect("Unable to cache result");
         // val.serialize(&mut Serializer::new(&mut buf)).unwrap();
         let bytes: Bytes = Bytes::from(buf);
 
         let _: () = self.client.set(key, RedisValue::from(bytes),
-                        Some(Expiration::EX(duration.into())),
-                        None, false).await.expect("Unable to cache result");
+                                    Some(Expiration::EX(duration.into())),
+                                    None, false).await.expect("Unable to cache result");
     }
 
     async fn delete_items(&self, wildcard: &str) {
-        let _ : u32 = self.client.del(wildcard).await.unwrap();
+        let _: u32 = self.client.del(wildcard).await.unwrap();
     }
 
     async fn clear(&self) {
@@ -218,8 +225,8 @@ pub struct NullCacheProvider {}
 #[async_trait]
 #[allow(unused_variables)]
 impl CacheProvider for NullCacheProvider {
-    fn new(url: String) -> Self {
-        NullCacheProvider{}
+    fn new(url: Option<&str>) -> Self {
+        NullCacheProvider {}
     }
     async fn is_cache_ready(&self) -> bool {
         true
@@ -235,10 +242,14 @@ impl CacheProvider for NullCacheProvider {
     async fn clear(&self) {}
 }
 
-pub struct HttpInvoker<T = NullCacheProvider> where T: CacheProvider {
-    base_url: Option<String>,
-    cache_provider: Option<T>,
+pub struct HttpInvoker<T: CacheProvider = NullCacheProvider> {
+    method: Method,
+    url: String,
+    headers: HashMap<String, String>,
+    body: Option<ByteArray>,
     proxy: Option<String>,
+    cache_config: Option<CacheConfig<T>>,
+    fault_tolerance: Option<FaultTolerance>,
 }
 
 pub enum Payload<T> where T: Serialize {
@@ -270,39 +281,55 @@ impl Payload<String> {
 }
 
 impl<T> HttpInvoker<T> where T: CacheProvider {
-    async fn do_request<U>(&self,
-                           config: HttpCallConfiguration,
-                           url: String,
-                           headers: HashMap<String, String>,
-                           query_params: HashMap<String, impl ToString>,
-                           payload: ByteArray)
-                           -> HttpResult<U> where U: for<'de> serde::Deserialize<'de> + Serialize + Send {
-        struct HttpRequest {
-            method: Method,
-            uri: String,
-            header_map: HeaderMap,
-            payload: ByteArray,
+    fn new(method: Method, url: &str) -> Self {
+        HttpInvoker {
+            method,
+            url: url.to_string(),
+            headers: HashMap::new(),
+            body: None,
+            cache_config: None,
+            proxy: None,
+            fault_tolerance: Some(FaultTolerance::default()),
         }
+    }
 
-        let uri = url + "?" + &query_params.iter()
-            .map(|v| format!("{}={}", v.0, v.1.to_string()))
-            .collect::<Vec<String>>().join("&");
+    fn get(url: &str) -> Self { HttpInvoker::new(Method::GET, url) }
 
-        let fault_tolerance = config.fault_tolerance.unwrap_or_default();
+    fn post(url: &str) -> Self {
+        HttpInvoker::new(Method::POST, url)
+    }
+
+    fn put(url: &str) -> Self {
+        HttpInvoker::new(Method::PUT, url)
+    }
+
+    fn delete(url: &str) -> Self {
+        HttpInvoker::new(Method::DELETE, url)
+    }
+
+    fn patch(url: &str) -> Self {
+        HttpInvoker::new(Method::PATCH, url)
+    }
+
+    async fn do_request<U>(&self) -> HttpResult<U> where U: for<'de> serde::Deserialize<'de> + Serialize + Send {
+        let fault_tolerance = self.fault_tolerance.clone().unwrap_or_default();
         let delay = Duration::from_millis(
             fault_tolerance.retry_config.backoff_factor as u64 * 1000);
         let tries = fault_tolerance.retry_config.total as usize;
         let policy = RetryPolicy::fixed(delay).with_max_retries(tries);
 
-        async fn inner_invoker<U>(req: &HttpRequest)
-                                  -> Result<HttpResult<U>, reqwest::Error>
+        async fn inner_invoker<U>(url: String, method: Method,
+                                  headers: HeaderMap,
+                                  payload: Option<ByteArray>) -> Result<HttpResult<U>, reqwest::Error>
             where for<'de> U: serde::de::Deserialize<'de> + Serialize {
             let client = reqwest::Client::new();
-            let res = client.request(
-                req.method.clone(),
-                req.uri.clone())
-                .timeout(Duration::from_secs(10))
-                .body(req.payload.clone()).send().await;
+            let mut req = client.request(method, url).headers(headers);
+            if payload.is_some() {
+                req = req.body(payload.unwrap());
+            }
+
+            let res = req.timeout(Duration::from_secs(10)).send().await;
+
 
             match res {
                 Ok(result) => {
@@ -323,78 +350,106 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
                         body,
                     })
                 }
-                Err(e) =>  {
+                Err(e) => {
                     println!("{}", e);
                     Err(e)
                 }
             }
         }
 
-        let method = config.method.clone();
         let mut header_map = HeaderMap::new();
-        for (key, value) in headers {
+        for (key, value) in &self.headers {
             header_map.append(HeaderName::try_from(key).unwrap(),
                               HeaderValue::from_str(value.as_str()).unwrap());
         }
 
-        let req = HttpRequest {
-            method,
-            uri,
-            header_map,
-            payload,
-        };
 
-        policy.retry(|| inner_invoker(&req)).await.unwrap()
+        inner_invoker(self.url.clone(),
+                      self.method.clone(),
+                      header_map,
+                      self.body.clone()).await.unwrap()
+
+        // policy.retry(|| inner_invoker(self.url.clone(),
+        //                               self.method.clone(),
+        //                               header_map,
+        //                               self.body.clone())).await.unwrap()
     }
 
-    async fn invoke<U>(&self,
-                       config: HttpCallConfiguration,
-                       payload: Payload<impl Serialize>,
-                       args: HashMap<&str, impl ToString + Hash + Copy>)
-                       -> HttpResult<U> where U: for<'de> Deserialize<'de> + Serialize + Send + Sync {
-        let re = Regex::new(PATH_PARAMS_PATTERN).unwrap();
-        let path_params = re.captures_iter(&config.url)
-            .map(|c| c.extract::<1>());
+    fn payload(mut self, payload: impl ToBinary) -> Self {
+        self.body = Some(payload.to_binary());
+        self
+    }
 
+    fn headers(mut self, headers: HashMap<&str, String>) -> Self {
+        for (key, value) in headers {
+            self.headers.insert(key.to_string(), value);
+        }
+        self
+    }
 
+    fn header(mut self, key: &str, value: String) -> Self {
+        self.headers.insert(key.to_string(), value);
+        self
+    }
+
+    fn cached(mut self, provider: T, duration: u32) -> Self {
+        self.cache_config = Some(CacheConfig {
+            provider,
+            duration,
+        });
+        self
+    }
+
+    fn param(self, name: &str, value: impl ToString + Hash + Copy) -> Self {
+        self.params(HashMap::from([(name, value)]))
+    }
+
+    fn params(mut self, args: HashMap<&str, impl ToString + Hash + Copy>) -> Self {
         let mut values = args.clone();
-        let url = path_params.fold(config.url.clone(), |u, (p, g)|
+        let re = Regex::new(PATH_PARAMS_PATTERN).unwrap();
+        let path_params = re.captures_iter(&self.url)
+            .map(|c| c.extract::<1>());
+        self.url = path_params.fold(self.url.clone(), |u, (p, g)|
             u.replace(p, &values.remove(g[0])
                 .unwrap_or_else(|| panic!("Url Parameter '{}' missing!", g[0])).to_string()));
-        let headers = config.header_params.iter()
-            .map(|p| (p.to_string(), values.remove(p.as_str())
-                .unwrap_or_else(|| panic!("Header parameter '{}' missing!", p)).to_string())).collect();
         let query_params = values.iter()
-            .map(|(p, v)| (p.to_string(), v.to_string())).collect();
+            .map(|(p, v)| (p.to_string(), v.to_string())).collect::<HashMap<String, String>>();
 
-        let ft = config.clone().fault_tolerance.unwrap_or_default();
-        if ft.cache_duration > 0u32 &&
-            self.cache_provider.is_some() {
-            let cache = self.cache_provider.as_ref().unwrap();
-            if cache.is_cache_ready().await {
-                let mut hasher = MurmurHasher::new();
-                config.url.hash(&mut hasher);
-                config.method.hash(&mut hasher);
-                args.iter().for_each(|a| a.hash(&mut hasher));
-                payload.to_binary().hash(&mut hasher);
-                let key = format!("http_cache_item:{:x}", hasher.finish());
+        self.url = self.url + "?" + &query_params.iter()
+            .map(|v| format!("{}={}", v.0, v.1.to_string()))
+            .collect::<Vec<String>>().join("&");
 
-                return if cache.is_cached(&key).await {
-                    cache.get_item(&key).await.unwrap_or_else(|| panic!("Cache item corrupted!"))
-                } else {
-                    let res = self.do_request::<U>(config.clone(), url.to_string(),
-                                                   headers,
-                                                   query_params, payload.to_binary()).await;
-                    if res.status.is_success() {
-                        cache.set_item(&key, &res, ft.cache_duration).await;
+        self
+    }
+
+    async fn invoke<U>(&self)
+                       -> HttpResult<U> where U: for<'de> Deserialize<'de> + Serialize + Send + Sync {
+        match &self.cache_config {
+            Some(cache_config) => {
+                let cache = &cache_config.provider;
+                if cache.is_cache_ready().await {
+                    let mut hasher = MurmurHasher::new();
+                    self.url.hash(&mut hasher);
+                    self.method.hash(&mut hasher);
+                    if self.body.is_some() {
+                        self.body.clone().unwrap().hash(&mut hasher);
                     }
-                    res
+                    let key = format!("http_cache_item:{:x}", hasher.finish());
+                    return if cache.is_cached(&key).await {
+                        cache.get_item(&key).await.unwrap_or_else(|| panic!("Cache item corrupted!"))
+                    } else {
+                        let res = self.do_request::<U>().await;
+                        if res.status.is_success() {
+                            cache.set_item(&key, &res, cache_config.duration).await;
+                        }
+                        res
+                    }
                 }
+                self.do_request::<U>().await
             }
+            None =>
+                return self.do_request::<U>().await
         }
-        self.do_request::<U>(config, url.to_string(),
-                             headers,
-                             query_params, payload.to_binary()).await
     }
 }
 
@@ -411,7 +466,7 @@ mod tests {
         employee_name: String,
         employee_salary: u32,
         id: u32,
-        profile_image: String
+        profile_image: String,
     }
 
     #[derive(Serialize, Deserialize)]
@@ -421,24 +476,10 @@ mod tests {
 
     #[tokio::test]
     async fn it_works() {
-        let cache = RedisCacheProvider::new("redis://127.0.0.1:6379".to_string());
-        let inv = HttpInvoker::<RedisCacheProvider> {
-            base_url: None,
-            cache_provider: Some(cache),
-            proxy: None,
-        };
+        let cache = RedisCacheProvider::new(Some("redis://127.0.0.1:6379"));
+        let res = HttpInvoker::get("https://dummy.restapiexample.com/api/v1/employee/{id}").param("id", 1).cached(cache, 10000).invoke::<ApiResponse<Employee>>().await;
 
         use core::default::Default;
-        let res = inv.invoke::<ApiResponse<Employee>>(
-            HttpCallConfiguration {
-                url: "https://dummy.restapiexample.com/api/v1/employee/{id}".to_string(),
-                fault_tolerance: Some(FaultTolerance {
-                    cache_duration: 1000,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }, Payload::empty(), HashMap::from([("id", 1)])).await;
-
         println!("{}", res.body.data.employee_name);
 
         assert_eq!(res.body.data.id, 1);
