@@ -70,8 +70,7 @@ pub struct HttpResult<T> where T: Serialize {
 pub struct FaultTolerance {
     timeout: u64,
     total: u8,
-    backoff_factor: u8,
-    method_white_list: HashSet<Method>,
+    backoff_factor: u8
 }
 
 impl Default for FaultTolerance {
@@ -79,8 +78,7 @@ impl Default for FaultTolerance {
         FaultTolerance {
             timeout: 30,
             total: 5,
-            backoff_factor: 5,
-            method_white_list: HashSet::from([(Method::GET)]),
+            backoff_factor: 5
         }
     }
 }
@@ -273,23 +271,25 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
                 Ok(result) => {
                     let status = result.status();
                     let headers = result.headers().clone();
+                    if result.status().is_success() {
+                        let body = result.json().await?;
 
-                    let body = result.json().await?;
+                        let header_map = headers.iter()
+                            .map(|(name, value)| {
+                                (name.to_string(), value.to_str().unwrap_or("").to_string())
+                            })
+                            .collect();
 
-                    let header_map = headers.iter()
-                        .map(|(name, value)| {
-                            (name.to_string(), value.to_str().unwrap_or("").to_string())
+                        Ok(HttpResult {
+                            status,
+                            headers: header_map,
+                            body,
                         })
-                        .collect();
-
-                    Ok(HttpResult {
-                        status,
-                        headers: header_map,
-                        body,
-                    })
+                    } else {
+                        panic!("Request error!")
+                    }
                 }
                 Err(e) => {
-                    println!("{}", e);
                     Err(e)
                 }
             }
@@ -381,14 +381,12 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
     fn retry(mut self,
              timeout: u64,
              total: u8,
-             backoff_factor: u8,
-             method_white_list: HashSet<Method>,
+             backoff_factor: u8
     ) -> Self {
         self.fault_tolerance = Some(FaultTolerance {
             timeout,
             total,
-            backoff_factor,
-            method_white_list,
+            backoff_factor
         });
         self
     }
@@ -448,7 +446,7 @@ mod tests {
     #[tokio::test]
     async fn it_works() {
         let cache = RedisCacheProvider::new(Some("redis://127.0.0.1:6379"));
-        let res = HttpInvoker::get("https://dummy.restapiexample.com/api/v1/employee/{id}").param("id", 1).cached(cache, 10000).retry(10, 3, 10, HashSet::from([Method::GET])).invoke::<ApiResponse<Employee>>().await;
+        let res = HttpInvoker::get("https://dummy.restapiexample.com/api/v1/employee/{id}").param("id", 1).cached(cache, 10000).retry(10, 3, 10).invoke::<ApiResponse<Employee>>().await;
 
         use core::default::Default;
         println!("{}", res.body.data.employee_name);
