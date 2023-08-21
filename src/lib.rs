@@ -309,15 +309,13 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
                 let tries = ft.total as usize;
                 let policy = RetryPolicy::fixed(delay).with_max_retries(tries);
 
-                let mut closure = || {
+                let mut_closure = &mut || {
                     inner_invoker(self.url.clone(),
                                   self.method.clone(),
                                   header_map.clone(),
                                   self.body.clone(),
                                   Some(Duration::from_secs(ft.timeout)))
                 };
-
-                let mut_closure = &mut closure;
 
                 policy.retry(mut_closure).await.unwrap()
             }
