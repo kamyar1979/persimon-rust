@@ -67,38 +67,23 @@ pub struct HttpResult<T> where T: Serialize {
 
 
 #[derive(Clone)]
-pub struct RetryConfig {
+pub struct FaultTolerance {
+    timeout: u64,
     total: u8,
     backoff_factor: u8,
-    status_force_list: HashSet<StatusCode>,
     method_white_list: HashSet<Method>,
 }
 
-impl Default for RetryConfig {
+impl Default for FaultTolerance {
     fn default() -> Self {
-        Self {
+        FaultTolerance {
+            timeout: 30,
             total: 5,
-            backoff_factor: 0,
-            status_force_list: HashSet::from([
-                StatusCode::TOO_MANY_REQUESTS,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                StatusCode::BAD_GATEWAY,
-                StatusCode::SERVICE_UNAVAILABLE,
-                StatusCode::METHOD_NOT_ALLOWED, ]),
-            method_white_list: HashSet::from([
-                Method::HEAD, Method::GET, Method::OPTIONS
-            ]),
+            backoff_factor: 5,
+            method_white_list: HashSet::from([(Method::GET)]),
         }
     }
 }
-
-#[derive(Clone)]
-pub struct FaultTolerance {
-    timeout: u8,
-    success_status: HashSet<StatusCode>,
-    retry_config: RetryConfig,
-}
-
 
 #[derive(Clone)]
 pub struct CacheConfig<T: CacheProvider> {
@@ -106,51 +91,6 @@ pub struct CacheConfig<T: CacheProvider> {
     provider: T,
 }
 
-
-impl Default for FaultTolerance {
-    fn default() -> Self {
-        Self {
-            timeout: 0,
-            success_status: HashSet::from([
-                StatusCode::OK,
-                StatusCode::CREATED,
-                StatusCode::NO_CONTENT,
-                StatusCode::ACCEPTED]),
-            retry_config: RetryConfig::default(),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct HttpCallConfiguration {
-    url: String,
-    method: Method,
-    inflection: bool,
-    raw_response: bool,
-    parse_unknown_response: bool,
-    header_params: HashSet<String>,
-}
-
-impl Default for HttpCallConfiguration {
-    fn default() -> Self {
-        Self {
-            url: "".to_string(),
-            method: Method::GET,
-            inflection: false,
-            raw_response: false,
-            parse_unknown_response: true,
-            header_params: HashSet::new(),
-        }
-    }
-}
-
-impl Hash for HttpCallConfiguration {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.url.hash(state);
-        self.method.hash(state);
-        state.finish();
-    }
-}
 
 #[async_trait]
 pub trait CacheProvider {
@@ -312,15 +252,11 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
     }
 
     async fn do_request<U>(&self) -> HttpResult<U> where U: for<'de> serde::Deserialize<'de> + Serialize + Send {
-        let fault_tolerance = self.fault_tolerance.clone().unwrap_or_default();
-        let delay = Duration::from_millis(
-            fault_tolerance.retry_config.backoff_factor as u64 * 1000);
-        let tries = fault_tolerance.retry_config.total as usize;
-        let policy = RetryPolicy::fixed(delay).with_max_retries(tries);
-
-        async fn inner_invoker<U>(url: String, method: Method,
+        async fn inner_invoker<U>(url: String,
+                                  method: Method,
                                   headers: HeaderMap,
-                                  payload: Option<ByteArray>) -> Result<HttpResult<U>, reqwest::Error>
+                                  payload: Option<ByteArray>,
+                                  timeout: Option<Duration>) -> Result<HttpResult<U>, reqwest::Error>
             where for<'de> U: serde::de::Deserialize<'de> + Serialize {
             let client = reqwest::Client::new();
             let mut req = client.request(method, url).headers(headers);
@@ -328,8 +264,10 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
                 req = req.body(payload.unwrap());
             }
 
-            let res = req.timeout(Duration::from_secs(10)).send().await;
-
+            let res = match timeout {
+                Some(t) => req.timeout(t).send().await,
+                None => req.send().await
+            };
 
             match res {
                 Ok(result) => {
@@ -364,15 +302,33 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
         }
 
 
-        inner_invoker(self.url.clone(),
-                      self.method.clone(),
-                      header_map,
-                      self.body.clone()).await.unwrap()
+        return match &self.fault_tolerance {
+            Some(ft) => {
+                let delay = Duration::from_millis(
+                    ft.backoff_factor as u64 * 1000);
+                let tries = ft.total as usize;
+                let policy = RetryPolicy::fixed(delay).with_max_retries(tries);
 
-        // policy.retry(|| inner_invoker(self.url.clone(),
-        //                               self.method.clone(),
-        //                               header_map,
-        //                               self.body.clone())).await.unwrap()
+                let mut closure = || {
+                    inner_invoker(self.url.clone(),
+                                  self.method.clone(),
+                                  header_map.clone(),
+                                  self.body.clone(),
+                                  Some(Duration::from_secs(ft.timeout)))
+                };
+
+                let mut_closure = &mut closure;
+
+                policy.retry(mut_closure).await.unwrap()
+            }
+            None =>
+                inner_invoker(self.url.clone(),
+                              self.method.clone(),
+                              header_map,
+                              self.body.clone(),
+                              None,
+                ).await.unwrap()
+        };
     }
 
     fn payload(mut self, payload: impl ToBinary) -> Self {
@@ -422,6 +378,21 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
         self
     }
 
+    fn retry(mut self,
+             timeout: u64,
+             total: u8,
+             backoff_factor: u8,
+             method_white_list: HashSet<Method>,
+    ) -> Self {
+        self.fault_tolerance = Some(FaultTolerance {
+            timeout,
+            total,
+            backoff_factor,
+            method_white_list,
+        });
+        self
+    }
+
     async fn invoke<U>(&self)
                        -> HttpResult<U> where U: for<'de> Deserialize<'de> + Serialize + Send + Sync {
         match &self.cache_config {
@@ -443,7 +414,7 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
                             cache.set_item(&key, &res, cache_config.duration).await;
                         }
                         res
-                    }
+                    };
                 }
                 self.do_request::<U>().await
             }
@@ -477,7 +448,7 @@ mod tests {
     #[tokio::test]
     async fn it_works() {
         let cache = RedisCacheProvider::new(Some("redis://127.0.0.1:6379"));
-        let res = HttpInvoker::get("https://dummy.restapiexample.com/api/v1/employee/{id}").param("id", 1).cached(cache, 10000).invoke::<ApiResponse<Employee>>().await;
+        let res = HttpInvoker::get("https://dummy.restapiexample.com/api/v1/employee/{id}").param("id", 1).cached(cache, 10000).retry(10, 3, 10, HashSet::from([Method::GET])).invoke::<ApiResponse<Employee>>().await;
 
         use core::default::Default;
         println!("{}", res.body.data.employee_name);
