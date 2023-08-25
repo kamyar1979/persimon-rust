@@ -26,11 +26,14 @@ use futures::{StreamExt, TryFutureExt};
 use crate::Payload::{Binary, Object, Text};
 use serde_json;
 use fred::prelude::*;
-use fred::types::Blocking::Error;
-use fred::types::ClusterHash::Custom;
 use futures::io::copy_buf;
 use ciborium::{de, ser};
 use fasthash::{FastHasher, MurmurHasher};
+
+use oapi::{OApi, OApiOperation};
+use sppparse::SparseRoot;
+use std::path::PathBuf;
+use fred::types::ScriptDebugFlag::No;
 
 type ByteArray = Vec<u8>;
 
@@ -70,7 +73,7 @@ pub struct HttpResult<T> where T: Serialize {
 pub struct FaultTolerance {
     timeout: u64,
     total: u8,
-    backoff_factor: u8
+    backoff_factor: u8,
 }
 
 impl Default for FaultTolerance {
@@ -78,7 +81,7 @@ impl Default for FaultTolerance {
         FaultTolerance {
             timeout: 30,
             total: 5,
-            backoff_factor: 5
+            backoff_factor: 5,
         }
     }
 }
@@ -379,12 +382,12 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
     fn retry(mut self,
              timeout: u64,
              total: u8,
-             backoff_factor: u8
+             backoff_factor: u8,
     ) -> Self {
         self.fault_tolerance = Some(FaultTolerance {
             timeout,
             total,
-            backoff_factor
+            backoff_factor,
         });
         self
     }
@@ -417,6 +420,50 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
             None =>
                 return self.do_request::<U>().await
         }
+    }
+}
+
+
+pub struct OpenApiInvoker<T> where T: CacheProvider {
+    openapi: OApi,
+    proxy: Option<String>,
+    cache_config: Option<CacheConfig<T>>,
+    fault_tolerance: Option<FaultTolerance>,
+}
+
+impl<T> OpenApiInvoker<T> where T: CacheProvider {
+    fn from_swagger(file: &str) -> Self {
+        let doc: OApi = OApi::new(
+            SparseRoot::new_from_file(PathBuf::from(file))
+                .expect("to parse the openapi")
+        );
+        doc.check().expect("Swagger has errors");
+        OpenApiInvoker {
+            openapi: doc,
+            proxy: None,
+            cache_config: None,
+            fault_tolerance: None,
+        }
+    }
+
+    fn operation(&self, operation_id: &str) -> Option<HttpInvoker> {
+        fn get_operation(op: &Option<OApiOperation>, op_id: &str) -> bool {
+            match op {
+                Some(o) => *o.operation_id() == Some(op_id.to_string()),
+                None => false
+            }
+        }
+
+        self.openapi.root_get().unwrap().paths().iter().find_map(|(s, p) | {
+            match p {
+                path if get_operation(path.get(), operation_id) => Some(HttpInvoker::get(s)),
+                path if get_operation(path.post(), operation_id) => Some(HttpInvoker::post(s)),
+                path if get_operation(path.put(), operation_id) => Some(HttpInvoker::put(s)),
+                path if get_operation(path.delete(), operation_id) => Some(HttpInvoker::delete(s)),
+                path if get_operation(path.patch(), operation_id) => Some(HttpInvoker::patch(s)),
+                _ => None
+            }
+        })
     }
 }
 
