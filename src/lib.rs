@@ -7,9 +7,10 @@ use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::{Debug, format};
+use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Read};
-use std::ops::Deref;
+use std::ops::{Add, Deref, Mul};
 use std::ptr::hash;
 use std::rc::Rc;
 use std::time::Duration;
@@ -30,10 +31,8 @@ use futures::io::copy_buf;
 use ciborium::{de, ser};
 use fasthash::{FastHasher, MurmurHasher};
 
-use oapi::{OApi, OApiOperation};
-use sppparse::SparseRoot;
 use std::path::PathBuf;
-use fred::types::ScriptDebugFlag::No;
+use openapiv3::{OpenAPI, Operation, PathItem, ReferenceOr};
 
 type ByteArray = Vec<u8>;
 
@@ -425,21 +424,21 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
 
 
 pub struct OpenApiInvoker<T> where T: CacheProvider {
-    openapi: OApi,
+    openapi: OpenAPI,
     proxy: Option<String>,
     cache_config: Option<CacheConfig<T>>,
     fault_tolerance: Option<FaultTolerance>,
 }
 
 impl<T> OpenApiInvoker<T> where T: CacheProvider {
-    fn from_swagger(file: &str) -> Self {
-        let doc: OApi = OApi::new(
-            SparseRoot::new_from_file(PathBuf::from(file))
-                .expect("to parse the openapi")
-        );
-        doc.check().expect("Swagger has errors");
+    fn from_file(path: &str) -> Self {
+        let mut file = File::open(path).unwrap();
+        let mut content = String::new();
+        file.read_to_string(&mut content).unwrap();
+        let openapi: OpenAPI = serde_yaml::from_str(content.as_str()).unwrap();
+
         OpenApiInvoker {
-            openapi: doc,
+            openapi,
             proxy: None,
             cache_config: None,
             fault_tolerance: None,
@@ -447,20 +446,22 @@ impl<T> OpenApiInvoker<T> where T: CacheProvider {
     }
 
     fn operation(&self, operation_id: &str) -> Option<HttpInvoker> {
-        fn get_operation(op: &Option<OApiOperation>, op_id: &str) -> bool {
+
+        fn get_operation(op: &Option<Operation>, op_id: &str) -> bool {
             match op {
-                Some(o) => *o.operation_id() == Some(op_id.to_string()),
+                Some(o) => o.operation_id == Some(op_id.to_string()),
                 None => false
             }
         }
 
-        self.openapi.root_get().unwrap().paths().iter().find_map(|(s, p) | {
-            match p {
-                path if get_operation(path.get(), operation_id) => Some(HttpInvoker::get(s)),
-                path if get_operation(path.post(), operation_id) => Some(HttpInvoker::post(s)),
-                path if get_operation(path.put(), operation_id) => Some(HttpInvoker::put(s)),
-                path if get_operation(path.delete(), operation_id) => Some(HttpInvoker::delete(s)),
-                path if get_operation(path.patch(), operation_id) => Some(HttpInvoker::patch(s)),
+        self.openapi.paths.iter().find_map(|(s, p) | {
+            let url = self.openapi.servers[0].url.to_string() + s;
+            match p.as_item() {
+                path if get_operation(&path?.get, operation_id) => Some(HttpInvoker::get(url.as_str())),
+                path if get_operation(&path?.post, operation_id) => Some(HttpInvoker::post(url.as_str())),
+                path if get_operation(&path?.put, operation_id) => Some(HttpInvoker::put(url.as_str())),
+                path if get_operation(&path?.delete, operation_id) => Some(HttpInvoker::delete(url.as_str())),
+                path if get_operation(&path?.patch, operation_id) => Some(HttpInvoker::patch(url.as_str())),
                 _ => None
             }
         })
@@ -488,14 +489,36 @@ mod tests {
         data: T,
     }
 
+
+    #[derive(Serialize, Deserialize)]
+    pub struct CollectionInfo {
+        vectors_count: u32,
+        // indexed_vector_count: u32,
+        points_count: u32,
+        segments_count: u32,
+        payload_schema: HashMap<String, String>
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct QdrantResponse<T> {
+        result: T,
+        status: String,
+        time: f32
+    }
+
+
+
     #[tokio::test]
     async fn it_works() {
         let cache = RedisCacheProvider::new(Some("redis://127.0.0.1:6379"));
-        let res = HttpInvoker::get("https://dummy.restapiexample.com/api/v1/employee/{id}").param("id", 1).cached(cache, 10000).retry(10, 3, 10).invoke::<ApiResponse<Employee>>().await;
+        // let res = HttpInvoker::get("https://dummy.restapiexample.com/api/v1/employee/{id}").param("id", 1).cached(cache, 10000).retry(10, 3, 10).invoke::<ApiResponse<Employee>>().await;
+        let res = OpenApiInvoker::<NullCacheProvider>::from_file("/Users/kamyar/Downloads/qdrant.json").operation("get_collection").unwrap().param("collection_name", "test_collection").invoke::<QdrantResponse<CollectionInfo>>().await;
 
-        use core::default::Default;
-        println!("{}", res.body.data.employee_name);
 
-        assert_eq!(res.body.data.id, 1);
+
+        // println!("{}", res.body.data.employee_name);
+        println!("{}", res.body.result.segments_count);
+
+        assert_eq!(res.body.result.vectors_count, 0);
     }
 }
