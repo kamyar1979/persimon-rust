@@ -86,7 +86,7 @@ impl Default for FaultTolerance {
 }
 
 #[derive(Clone)]
-pub struct CacheConfig<T: CacheProvider> {
+pub struct CacheConfig<T = NullCacheProvider> where T: CacheProvider {
     duration: u32,
     provider: T,
 }
@@ -182,7 +182,7 @@ impl CacheProvider for NullCacheProvider {
     async fn clear(&self) {}
 }
 
-pub struct HttpInvoker<T: CacheProvider = NullCacheProvider> {
+pub struct HttpInvoker<T = NullCacheProvider> where T: CacheProvider {
     method: Method,
     url: String,
     headers: HashMap<String, String>,
@@ -435,7 +435,7 @@ impl<T> OpenApiInvoker<T> where T: CacheProvider {
         let mut file = File::open(path).unwrap();
         let mut content = String::new();
         file.read_to_string(&mut content).unwrap();
-        let openapi: OpenAPI = serde_yaml::from_str(content.as_str()).unwrap();
+        let openapi: OpenAPI = serde_json::from_str(content.as_str()).unwrap();
 
         OpenApiInvoker {
             openapi,
@@ -446,7 +446,6 @@ impl<T> OpenApiInvoker<T> where T: CacheProvider {
     }
 
     fn operation(&self, operation_id: &str) -> Option<HttpInvoker> {
-
         fn get_operation(op: &Option<Operation>, op_id: &str) -> bool {
             match op {
                 Some(o) => o.operation_id == Some(op_id.to_string()),
@@ -454,7 +453,7 @@ impl<T> OpenApiInvoker<T> where T: CacheProvider {
             }
         }
 
-        self.openapi.paths.iter().find_map(|(s, p) | {
+        self.openapi.paths.iter().find_map(|(s, p)| {
             let url = self.openapi.servers[0].url.to_string() + s;
             match p.as_item() {
                 path if get_operation(&path?.get, operation_id) => Some(HttpInvoker::get(url.as_str())),
@@ -496,29 +495,51 @@ mod tests {
         // indexed_vector_count: u32,
         points_count: u32,
         segments_count: u32,
-        payload_schema: HashMap<String, String>
+        payload_schema: HashMap<String, String>,
     }
 
     #[derive(Serialize, Deserialize)]
     pub struct QdrantResponse<T> {
         result: T,
         status: String,
-        time: f32
+        time: f32,
     }
 
 
+    #[tokio::test]
+    async fn invoke_no_cache() {
+        let invoker : HttpInvoker = HttpInvoker::get("https://dummy.restapiexample.com/api/v1/employee/{id}");
+        let res = invoker.param("id", 1)
+            .retry(10, 3, 10)
+            .invoke::<ApiResponse<Employee>>().await;
+
+        println!("{}", res.body.data.employee_name);
+        assert_eq!(res.body.data.id, 1)
+    }
 
     #[tokio::test]
-    async fn it_works() {
+    async fn invoke_cache() {
         let cache = RedisCacheProvider::new(Some("redis://127.0.0.1:6379"));
-        // let res = HttpInvoker::get("https://dummy.restapiexample.com/api/v1/employee/{id}").param("id", 1).cached(cache, 10000).retry(10, 3, 10).invoke::<ApiResponse<Employee>>().await;
-        let res = OpenApiInvoker::<NullCacheProvider>::from_file("/Users/kamyar/Downloads/qdrant.json").operation("get_collection").unwrap().param("collection_name", "test_collection").invoke::<QdrantResponse<CollectionInfo>>().await;
+        let invoker= HttpInvoker::get("https://dummy.restapiexample.com/api/v1/employee/{id}");
+        let res = invoker.cached(cache, 10000)
+            .param("id", 1)
+            .retry(10, 3, 10)
+            .invoke::<ApiResponse<Employee>>().await;
 
+        println!("{}", res.body.data.employee_name);
+        assert_eq!(res.body.data.id, 1)
+    }
 
+    #[tokio::test]
+    async fn invoke_swagger() {
+        let invoker = OpenApiInvoker::<NullCacheProvider>::from_file("/Users/kamyar/Downloads/qdrant.json");
+        let res = invoker
+            .operation("get_collection").unwrap()
+            .param("collection_name", "test_collection")
+            .invoke::<QdrantResponse<CollectionInfo>>().await;
 
-        // println!("{}", res.body.data.employee_name);
         println!("{}", res.body.result.segments_count);
-
         assert_eq!(res.body.result.vectors_count, 0);
+
     }
 }
