@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
-use std::any::{Any, TypeId};
 use std::string::String;
 use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -10,7 +9,6 @@ use std::fmt::{Debug, format};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Read};
-use std::ops::{Add, Deref, Mul};
 use std::ptr::hash;
 use std::rc::Rc;
 use std::time::Duration;
@@ -23,7 +21,6 @@ use tokio::spawn;
 use serde::{Serialize, Deserialize};
 use async_trait::async_trait;
 use fred::bytes::Bytes;
-use futures::{StreamExt, TryFutureExt};
 use crate::Payload::{Binary, Object, Text};
 use serde_json;
 use fred::prelude::*;
@@ -69,15 +66,15 @@ pub struct HttpResult<T> where T: Serialize {
 
 
 #[derive(Clone)]
-pub struct FaultTolerance {
+pub struct Retry {
     timeout: u64,
     total: u8,
     backoff_factor: u8,
 }
 
-impl Default for FaultTolerance {
+impl Default for Retry {
     fn default() -> Self {
-        FaultTolerance {
+        Retry {
             timeout: 30,
             total: 5,
             backoff_factor: 5,
@@ -189,7 +186,7 @@ pub struct HttpInvoker<T = NullCacheProvider> where T: CacheProvider {
     body: Option<ByteArray>,
     proxy: Option<String>,
     cache_config: Option<CacheConfig<T>>,
-    fault_tolerance: Option<FaultTolerance>,
+    retry_config: Option<Retry>
 }
 
 pub enum Payload<T> where T: Serialize {
@@ -229,7 +226,7 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
             body: None,
             cache_config: None,
             proxy: None,
-            fault_tolerance: Some(FaultTolerance::default()),
+            retry_config: Some(Retry::default())
         }
     }
 
@@ -275,7 +272,6 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
                     let headers = result.headers().clone();
                     if result.status().is_success() {
                         let body = result.json().await?;
-
                         let header_map = headers.iter()
                             .map(|(name, value)| {
                                 (name.to_string(), value.to_str().unwrap_or("").to_string())
@@ -304,7 +300,7 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
         }
 
 
-        return match &self.fault_tolerance {
+        return match &self.retry_config {
             Some(ft) => {
                 let delay = Duration::from_millis(
                     ft.backoff_factor as u64 * 1000);
@@ -379,15 +375,9 @@ impl<T> HttpInvoker<T> where T: CacheProvider {
     }
 
     fn retry(mut self,
-             timeout: u64,
-             total: u8,
-             backoff_factor: u8,
+             conf: Retry
     ) -> Self {
-        self.fault_tolerance = Some(FaultTolerance {
-            timeout,
-            total,
-            backoff_factor,
-        });
+        self.retry_config = Some(conf);
         self
     }
 
@@ -427,7 +417,7 @@ pub struct OpenApiInvoker<T> where T: CacheProvider {
     openapi: OpenAPI,
     proxy: Option<String>,
     cache_config: Option<CacheConfig<T>>,
-    fault_tolerance: Option<FaultTolerance>,
+    fault_tolerance: Option<Retry>,
 }
 
 impl<T> OpenApiInvoker<T> where T: CacheProvider {
@@ -510,11 +500,11 @@ mod tests {
     async fn invoke_no_cache() {
         let invoker : HttpInvoker = HttpInvoker::get("https://dummy.restapiexample.com/api/v1/employee/{id}");
         let res = invoker.param("id", 1)
-            .retry(10, 3, 10)
+            .retry(Retry{timeout: 10, total: 3, backoff_factor: 10})
             .invoke::<ApiResponse<Employee>>().await;
 
         println!("{}", res.body.data.employee_name);
-        assert_eq!(res.body.data.id, 1)
+        assert_eq!(res.body.data.id, 1);
     }
 
     #[tokio::test]
@@ -523,23 +513,23 @@ mod tests {
         let invoker= HttpInvoker::get("https://dummy.restapiexample.com/api/v1/employee/{id}");
         let res = invoker.cached(cache, 10000)
             .param("id", 1)
-            .retry(10, 3, 10)
+            .retry(Retry{timeout: 10, total: 3, backoff_factor: 10})
             .invoke::<ApiResponse<Employee>>().await;
 
         println!("{}", res.body.data.employee_name);
-        assert_eq!(res.body.data.id, 1)
+        assert_eq!(res.body.data.id, 1);
     }
 
-    #[tokio::test]
-    async fn invoke_swagger() {
-        let invoker = OpenApiInvoker::<NullCacheProvider>::from_file("/Users/kamyar/Downloads/qdrant.json");
-        let res = invoker
-            .operation("get_collection").unwrap()
-            .param("collection_name", "test_collection")
-            .invoke::<QdrantResponse<CollectionInfo>>().await;
-
-        println!("{}", res.body.result.segments_count);
-        assert_eq!(res.body.result.vectors_count, 0);
-
-    }
+    // #[tokio::test]
+    // async fn invoke_swagger() {
+    //     let invoker = OpenApiInvoker::<NullCacheProvider>::from_file("/Users/kamyar/Downloads/qdrant.json");
+    //     let res = invoker
+    //         .operation("get_collection").unwrap()
+    //         .param("collection_name", "test_collection")
+    //         .invoke::<QdrantResponse<CollectionInfo>>().await;
+    //
+    //     println!("{}", res.body.result.segments_count);
+    //     assert_eq!(res.body.result.vectors_count, 0);
+    //
+    // }
 }
