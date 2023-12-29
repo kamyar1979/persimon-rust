@@ -12,10 +12,10 @@ tokio = { version = "1.12.0", features = ["full"] } # for our async runtime
 again = "0.1"
 regex = "1.9.1"
 serde = { version = "1.0", features = ["derive"] }
-async-trait = "0.1.72"
 serde_json = "1.0"
-fred = "6.3.0"
+fred = "7.1.0"
 ciborium = "0.2.1"
 fasthash = "0.4.0"
-openapiv3 = "1.0.2"
+openapiv3 = "2.0.0"
 serde_yaml = "0.9.25"
+trait-variant = "0.1.0"

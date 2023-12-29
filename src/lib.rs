@@ -19,7 +19,6 @@ use regex::Regex;
 use again::RetryPolicy;
 use tokio::spawn;
 use serde::{Serialize, Deserialize};
-use async_trait::async_trait;
 use fred::bytes::Bytes;
 use crate::Payload::{Binary, Object, Text};
 use serde_json;
@@ -89,13 +88,13 @@ pub struct CacheConfig<T = NullCacheProvider> where T: CacheProvider {
 }
 
 
-#[async_trait]
+#[trait_variant::make(SafeCacheProvider: Send)]
 pub trait CacheProvider {
     fn new(url: Option<&str>) -> Self;
     async fn is_cache_ready(&self) -> bool;
     async fn is_cached(&self, key: &str) -> bool;
-    async fn get_item<T>(&self, key: &str) -> Option<T> where T: for<'de> serde::Deserialize<'de> + Send;
-    async fn set_item<T>(&self, key: &str, val: T, duration: u32) where T: Send + Serialize;
+    async fn get_item<U>(&self, key: &str) -> Option<U> where U: for<'de> serde::Deserialize<'de> + Send;
+    async fn set_item<U>(&self, key: &str, val: U, duration: u32) where U: Send + Serialize;
     async fn delete_items(&self, wildcard: &str);
     async fn clear(&self);
 }
@@ -104,7 +103,6 @@ pub struct RedisCacheProvider {
     client: RedisClient,
 }
 
-#[async_trait]
 impl CacheProvider for RedisCacheProvider {
     fn new(url: Option<&str>) -> Self {
         let config = if url.is_some() {
@@ -114,7 +112,8 @@ impl CacheProvider for RedisCacheProvider {
         };
         let perf = PerformanceConfig::default();
         let policy = ReconnectPolicy::default();
-        Self { client: RedisClient::new(config.unwrap(), Some(perf), Some(policy)) }
+        let conn_conf = ConnectionConfig::default();
+        Self { client: RedisClient::new(config.unwrap(), Some(perf), Some(conn_conf), Some(policy)) }
     }
 
     async fn is_cache_ready(&self) -> bool {
@@ -159,7 +158,6 @@ impl CacheProvider for RedisCacheProvider {
 
 pub struct NullCacheProvider {}
 
-#[async_trait]
 #[allow(unused_variables)]
 impl CacheProvider for NullCacheProvider {
     fn new(url: Option<&str>) -> Self {
